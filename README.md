@@ -5,6 +5,10 @@ A userspace Tor tunnel for agents. No root, no systemd, no PySocks.
 Gives you a SOCKS5 egress with exit rotation, a `curl` wrapper, and a Python session that works even when `requests` can't speak SOCKS because PySocks won't install.
 
 ```
+https://github.com/mhs003/torctl
+```
+
+```
 scripts/torctl up        # start, wait for bootstrap, verify egress
 scripts/torctl status    # state + current exit IP
 scripts/torctl rotate    # request a new circuit
@@ -36,7 +40,7 @@ brew install tor
 As an agent skill, drop the folder in your skills directory:
 
 ```bash
-git clone <this-repo> ~/.agents/skills/torctl
+git clone https://github.com/mhs003/torctl ~/.agents/skills/torctl
 ```
 
 Or just use the scripts directly — they have no dependency on the skill layout.
