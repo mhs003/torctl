@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# torctl — userspace Tor tunnel controller (no root, no systemd)
+#
+#   torctl up       start and wait for bootstrap, verify egress
+#   torctl down     stop via PID file
+#   torctl status   show state and current exit
+#   torctl rotate   request a new circuit (NEWNYM)
+
+set -uo pipefail
+
+TORCTL_HOME="${TORCTL_HOME:-$HOME/.cache/torctl}"
+PIDFILE="$TORCTL_HOME/tor.pid"
+TORRC="$TORCTL_HOME/torrc"
+LOG="$TORCTL_HOME/tor.log"
+DATA="$TORCTL_HOME/data"
+COOKIE="$DATA/control_auth_cookie"
+SOCKS_PORT="${TORCTL_SOCKS_PORT:-9050}"
+CTRL_PORT="${TORCTL_CTRL_PORT:-9051}"
+
+die() { echo "torctl: $*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+write_torrc() {
+  mkdir -p "$DATA"
+  cat > "$TORRC" <<EOF
+SocksPort $SOCKS_PORT
+ControlPort $CTRL_PORT
+CookieAuthentication 1
+DataDirectory $DATA
+Log notice file $LOG
+EOF
+}
+
+running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0 || return 1
+  fi
+}
+
+cmd_up() {
+  have tor || die "tor not found on PATH (apt install tor / brew install tor)"
+  have curl || die "curl not found on PATH"
+
+  if running; then
+    echo "already running (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+
+  # A tor already holding our ports is either a leftover instance or a
+  # system-wide tor. Both mean this config cannot bind, and tor exits silently
+  # enough that it looks like a bootstrap failure later. Fail loudly instead.
+  if port_in_use "$SOCKS_PORT"; then
+    die "port $SOCKS_PORT already in use (another tor running?). Use TORCTL_SOCKS_PORT=<port> TORCTL_CTRL_PORT=<port> to pick different ones."
+  fi
+  if port_in_use "$CTRL_PORT"; then
+    die "port $CTRL_PORT already in use. Set TORCTL_CTRL_PORT=<port> to pick another."
+  fi
+
+  write_torrc
+  : > "$LOG"
+
+  nohup tor -f "$TORRC" > "$TORCTL_HOME/stdout.log" 2>&1 &
+  echo $! > "$PIDFILE"
+  echo "started tor pid=$(cat "$PIDFILE")"
+
+  local i
+  for i in $(seq 1 40); do
+    if grep -q 'Bootstrapped 100%' "$LOG" 2>/dev/null; then
+      echo "bootstrapped 100%"
+      break
+    fi
+    sleep 3
+  done
+
+  if ! grep -q 'Bootstrapped 100%' "$LOG" 2>/dev/null; then
+    echo "torctl: did not reach 100% in time — last log lines:" >&2
+    tail -5 "$LOG" 2>/dev/null >&2 || echo "(log empty — tor may have exited on startup)" >&2
+    if ! running; then
+      echo "torctl: process is gone. stdout:" >&2
+      tail -5 "$TORCTL_HOME/stdout.log" 2>/dev/null >&2
+    fi
+    return 1
+  fi
+
+  local out attempt
+  for attempt in 1 2 3; do
+    out=$(curl -sS -m 40 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+          "https://check.torproject.org/api/ip" 2>/dev/null)
+    [ -n "$out" ] && break
+    sleep 5
+  done
+  echo "exit check: ${out:-<no response>}"
+
+  case "$out" in
+    *'"IsTor":true'*) return 0 ;;
+    *) echo "torctl: egress is NOT going through tor" >&2; return 1 ;;
+  esac
+}
+
+cmd_down() {
+  if [ ! -f "$PIDFILE" ]; then
+    echo "not running (no pid file)"
+    return 0
+  fi
+  local p
+  p=$(cat "$PIDFILE")
+  if kill -0 "$p" 2>/dev/null; then
+    kill "$p" && echo "stopped tor pid=$p"
+  else
+    echo "stale pid file, process $p gone"
+  fi
+  rm -f "$PIDFILE"
+}
+
+cmd_status() {
+  if running; then
+    echo "running (pid $(cat "$PIDFILE"))"
+    local out
+    # generous timeout: a fresh circuit can take several seconds to settle
+    out=$(curl -sS -m 60 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+          "https://check.torproject.org/api/ip" 2>/dev/null)
+    if [ -z "$out" ]; then
+      echo "exit: <no response — circuit may still be building, retry>"
+      return 1
+    fi
+    echo "exit: $out"
+    case "$out" in
+      *'"IsTor":false'*) echo "warning: egress is NOT through tor" >&2; return 1 ;;
+    esac
+  else
+    echo "not running"
+    return 1
+  fi
+}
+
+cmd_rotate() {
+  running || die "tor not running"
+  [ -r "$COOKIE" ] || die "no control auth cookie at $COOKIE"
+  local hex
+  hex=$(od -An -tx1 "$COOKIE" | tr -d ' \n')
+  {
+    printf 'AUTHENTICATE %s\r\n' "$hex"
+    printf 'SIGNAL NEWNYM\r\n'
+    printf 'QUIT\r\n'
+    sleep 0.3
+  } | timeout 5 nc 127.0.0.1 "$CTRL_PORT" >/dev/null 2>&1 \
+    || die "could not reach control port $CTRL_PORT (is nc installed?)"
+  echo "new circuit requested"
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  rotate) cmd_rotate ;;
+  *) echo "usage: $0 {up|down|status|rotate}" >&2; exit 64 ;;
+esac

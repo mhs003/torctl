@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# tor-curl — curl through the torctl SOCKS proxy
+#
+#   tor-curl -n <curl args...>    request a new circuit first
+#   tor-curl <curl args...>       reuse the current circuit
+#
+# All other arguments pass straight through to curl.
+
+set -uo pipefail
+
+TORCTL_HOME="${TORCTL_HOME:-$HOME/.cache/torctl}"
+SOCKS_PORT="${TORCTL_SOCKS_PORT:-9050}"
+CTRL_PORT="${TORCTL_CTRL_PORT:-9051}"
+COOKIE="$TORCTL_HOME/data/control_auth_cookie"
+
+newnym() {
+  if [ ! -r "$COOKIE" ]; then
+    echo "tor-curl: no control cookie at $COOKIE (run torctl up)" >&2
+    return 1
+  fi
+  local hex
+  hex=$(od -An -tx1 "$COOKIE" | tr -d ' \n')
+  {
+    printf 'AUTHENTICATE %s\r\n' "$hex"
+    printf 'SIGNAL NEWNYM\r\n'
+    printf 'QUIT\r\n'
+    sleep 0.3
+  } | timeout 5 nc 127.0.0.1 "$CTRL_PORT" >/dev/null 2>&1
+}
+
+if [ "${1:-}" = "-n" ]; then
+  shift
+  newnym || echo "tor-curl: NEWNYM failed, using current circuit" >&2
+  sleep 1
+fi
+
+exec curl -sS --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$@"
